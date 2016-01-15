@@ -7,6 +7,11 @@ defmodule BlueESC do
   -32767 (max reverse) to 32767 (max forward)
   """
   use GenServer
+  require Logger
+
+  def start(devname, address, class, opts \\ []) do
+    GenServer.start(__MODULE__, [devname, address, class], opts)
+  end
 
   @doc false
   def start_link(devname, address, class, opts \\ []) do
@@ -24,101 +29,126 @@ defmodule BlueESC do
     #REVIEW: Trap Exit of i2c process?
     {:ok, pid} = I2c.start_link(devname, address)
 
-    initialize_controller(pid)
+    #Make sure ESC properly attached
+    << _ :: 64, alive :: 8-big >> = read_all_registers(%{i2c_pid: pid})
+    Logger.debug "ESC returned alive: #{inspect alive}"
 
-    # Read the data registers at rate about 4hz
-    :timer.send_interval(250, :update)
+    case alive do
+      0xAB ->
+        Logger.debug "ECS Found, Initializing..."
+        initialize_controller(pid)
+        Logger.debug "ESC Initialized"
 
-    {:ok, %{i2c_pid: pid, rpm: 0, update_time: 0, poll_factor: poll_factor, volts: nil, temp: nil, current: nil}}
+        # Read the data registers at rate about 4hz
+        :timer.send_interval(250, :update)
+        {:ok, %{i2c_pid: pid, rpm: 0, update_time: 0, poll_factor: poll_factor, volts: nil, temp: nil, current: nil, throttle: 0}}
+      _ ->
+        Logger.debug "Failed to communicate with ESC"
+        {:stop, :no_esc_found}
+    end
+  end
+
+  def get_state(pid) do
+    GenServer.call pid, :get_state
+  end
+
+  def handle_call(:get_state, state) do
+    {:reply, state, state}
   end
 
   @doc "Sets the controller to stop"
-  def stop do
-    GenServer.call self, :stop
+  def stop(pid) do
+    GenServer.call pid, :stop
   end
 
   @doc "Returns the last read RPM"
-  def rpm do
-    GenServer.call self, :get_rpm
+  def rpm(pid) do
+    GenServer.call pid, :get_rpm
   end
 
   @doc """
     Sets the speed of the controller
     Values: -100 (reverse) to 100 (forward) in persentage
-    iex > set_speed(100)
+    iex > set_speed(pid, 100)
     {:ok, _} #TODO: get response
   """
-  def set_speed(speed_percent) do
+  def set_speed(pid, speed_percent) do
     case speed_percent do
-      0 -> stop
+      0 -> stop(pid)
       sp ->
-        speed = 327.67 * sp
-        GenServer.call self, {:set_speed, speed}
+        speed =
+          327.67 * sp
+          |> round
+        GenServer.call pid, {:set_speed, speed}
     end
   end
 
   @doc """
   Returns the last read voltage from the last full update
   """
-  def voltage, do: GenServer.call(self, :last_voltage)
+  def voltage(pid), do: GenServer.call(pid, :last_voltage)
   @doc """
   Reads the ECS registers and returns the voltage
   Note: Advised to use voltage/0 unless the delay (~250ms)
   is unacceptable
   """
-  def voltage!, do: GenServer.call(self, :get_voltage)
+  def voltage!(pid), do: GenServer.call(pid, :get_voltage)
 
   @doc """
   Read curernt of ESC
   """
-  def current, do: GenServer.call(self, :last_current)
+  def current(pid), do: GenServer.call(pid, :last_current)
   @doc """
   Reads the ECS registers and returns the current
   Note: Advised to use current/0 unless the delay (~250ms)
   is unacceptable
   """
-  def current!, do: GenServer.call(self, :get_current)
+  def current!(pid), do: GenServer.call(pid, :get_current)
 
   @doc """
   Read temperature of controller
   """
-  def temperature, do: GenServer.call(self, :last_temperature)
+  def temperature(pid), do: GenServer.call(pid, :last_temperature)
   @doc """
   Reads the ECS registers and returns the temperature
   Note: Advised to use tempurature/0 unless the delay (~250ms)
   is unacceptable
   """
-  def temperature!, do: GenServer.call(self, :get_temperature)
+  def temperature!(pid), do: GenServer.call(pid, :get_temperature)
 
-  def handle_call(:stop, state) do
-    {:ok, response} = initialize_controller(state.i2c_pid)
-    {:reply, response, state}
+  def handle_call(:stop, _from, state) do
+    case initialize_controller(state.i2c_pid) do
+      :ok -> {:reply, :ok, %{state | throttle: 0}}
+      _ -> {:reply, :error, state}
+   end
   end
 
-  def handle_call(:get_rpm, state), do: {:reply, state.rpm, state}
+  def handle_call(:get_rpm, _from, state), do: {:reply, state.rpm, state}
 
-  def handle_call({:set_speed, speed}, state) do
-    {:ok, response} = I2c.write(state.i2c_pid, <<0x0, speed :: 16-big>>)
-    {:reply, response, state}
+  def handle_call({:set_speed, speed}, _from, state) do
+    case I2c.write(state.i2c_pid, <<0x0, speed :: 16-little>>) do
+      :ok -> {:reply, :ok, %{state | throttle: speed}}
+      _ -> {:reply, :error, state}
+    end
   end
 
-  def handle_call(:last_voltage, state), do: {:reply, state.volts, state}
+  def handle_call(:last_voltage, _from, state), do: {:reply, state.volts, state}
 
-  def handle_call(:get_voltage, state) do
+  def handle_call(:get_voltage, _from, state) do
     raw_volts = read_two_registers(0x04, state)
     {:reply, compute_voltage(raw_volts), state}
   end
 
-  def handle_call(:last_current, state), do: {:reply, state.current, state}
+  def handle_call(:last_current, _from, state), do: {:reply, state.current, state}
 
-  def handle_call(:get_current, state) do
+  def handle_call(:get_current, _from, state) do
     raw_current = read_two_registers(0x08, state)
     {:reply, compute_current(raw_current), state}
   end
 
-  def handle_call(:last_temperature, state), do: {:reply, state.temp, state}
+  def handle_call(:last_temperature, _from, state), do: {:reply, state.temp, state}
 
-  def handle_call(:get_temperature, state) do
+  def handle_call(:get_temperature, _from, state) do
     raw_temp = read_two_registers(0x06, state)
     {:reply, compute_temp(raw_temp), state}
   end
@@ -128,11 +158,14 @@ defmodule BlueESC do
   # must be called at least every 65 seconds to prevent 16-bit overflow of
   # the timer keeping track of RPM. Recommended to call this function at 4-10 Hz
   def handle_info(:update, state) do
+    #REVIEW: Hack to keep controller alive
+    I2c.write state.i2c_pid, << 0x0, state.throttle :: 16-big >>
     <<
-      pulse_count :: 16-little,
-      raw_v :: 16-little,
-      raw_temp :: 16-little,
-      raw_cur :: 16-little
+      pulse_count :: 16-big,
+      raw_v :: 16-big,
+      raw_temp :: 16-big,
+      raw_cur :: 16-big,
+      _alive :: 8-big
     >> = read_all_registers(state)
 
     [rpm, time] = compute_rpm pulse_count, state

@@ -14,7 +14,6 @@ defmodule BlueESC.Mixfile do
   #
   # Type `mix help compile.app` for more information
   def application, do: [
-    mod:           { BlueESC, [] },
     applications: [:logger, :elixir_ale]
   ]
 

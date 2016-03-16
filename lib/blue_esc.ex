@@ -31,11 +31,9 @@ defmodule BlueESC do
 
     #Make sure ESC properly attached
     << _ :: 64, alive :: 8-big >> = read_all_registers(%{i2c_pid: pid})
-    Logger.debug "ESC returned alive: #{inspect alive}"
-
     case alive do
       0xAB ->
-        Logger.debug "ECS Found, Initializing..."
+        Logger.debug "ESC Found, Initializing..."
         initialize_controller(pid)
         Logger.debug "ESC Initialized"
 
